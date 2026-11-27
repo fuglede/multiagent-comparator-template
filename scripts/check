@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+
+if [[ $# -gt 1 ]]; then
+  echo 'Usage: scripts/check [BASE_COMMIT]' >&2
+  exit 2
+fi
+
+if [[ $# == 1 ]]; then
+  git cat-file -e "$1^{commit}"
+  if [[ ! -f Solution.lean ]] && git cat-file -e "$1:Solution.lean" 2>/dev/null; then
+    echo 'The base has a solution. Keep Solution.lean in the verified tree.' >&2
+    exit 1
+  fi
+fi
+
+./scripts/tasks lint
+if [[ -f Solution.lean ]]; then
+  lake comparator
+fi
+lake check
+if [[ ! -f Solution.lean ]]; then
+  lake build Challenge
+fi

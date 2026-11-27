@@ -1,0 +1,6 @@
+{
+  "challenge_module": "Challenge",
+  "solution_module": "Solution",
+  "theorem_names": ["Challenge.goal"],
+  "permitted_axioms": ["propext", "Classical.choice", "Quot.sound"]
+}

@@ -1,0 +1,15 @@
+name = "lean_challenge"
+defaultTargets = ["Proofs"]
+
+[[lean_lib]]
+name = "Proofs"
+globs = ["Proofs.*"]
+
+[[lean_lib]]
+name = "Statement"
+
+[[lean_lib]]
+name = "Challenge"
+
+[[lean_lib]]
+name = "Solution"

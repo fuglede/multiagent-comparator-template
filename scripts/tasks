@@ -1,0 +1,540 @@
+#!/usr/bin/env python3
+"""Coordinate research tasks and commit-specific reviews through a shared Git remote."""
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import subprocess
+import tempfile
+import time
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+REMOTE = "origin"
+ID = re.compile(r"[a-z0-9][a-z0-9-]{1,48}[a-z0-9]")
+AVENUE = re.compile(r"^### Avenue `([a-z0-9-]+)`", re.M)
+COMMENT = re.compile(r"<!--.*?-->", re.S)
+AREAS = ("lean", "math", "python", "notes", "lit", "infra")
+PRIORITIES = ("1", "2", "3", "new")
+STATUSES = ("open", "claimed", "done", "dropped")
+STALE_HOURS = 48
+TEMPLATE = """---
+id: {id}
+title: {title}
+status: open
+area: {area}
+avenue: {avenue}
+priority: {priority}
+created_by: {agent}
+owner:
+depends: [{depends}]
+created: {date}
+---
+
+## Goal
+{goal}
+
+## Context
+<!-- Relevant notes, modules, references, and previous attempts. -->
+
+## Done when
+<!-- Give a checkable completion criterion. -->
+
+## Outcome
+<!-- Record what was learned, its evidence, and any follow-up tasks. -->
+
+## Log
+- {date} {agent}: created
+"""
+
+
+def git(*args, cwd=ROOT, data=None, optional=False):
+    result = subprocess.run(["git", *args], cwd=cwd, input=data, text=True, capture_output=True)
+    if result.returncode:
+        if optional:
+            return None
+        raise SystemExit(f"git {' '.join(args)} failed:\n{result.stderr.strip()}")
+    return result.stdout.strip()
+
+
+def require_repository():
+    checkout = git("rev-parse", "--show-toplevel", optional=True)
+    if not checkout or Path(checkout).resolve() != ROOT:
+        raise SystemExit("Copy the template contents to the root of a Git repository first.")
+
+
+def identity(args):
+    name = args.agent or os.environ.get("TASKS_AGENT", "")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}", name):
+        raise SystemExit("Set TASKS_AGENT or --agent to a stable, unique session name such as algebra-1.")
+    return name
+
+
+def snapshot(fetch=True):
+    if fetch:
+        git("fetch", "--quiet", "--prune", REMOTE)
+    prefix = f"refs/remotes/{REMOTE}/"
+    refs = dict(
+        line.removeprefix(prefix).split(" ", 1)
+        for line in git("for-each-ref", "--format=%(refname) %(objectname)", prefix).splitlines()
+    )
+    symbolic = git("symbolic-ref", "--quiet", f"{prefix}HEAD", optional=True) or ""
+    base = os.environ.get("TASKS_BASE") or symbolic.removeprefix(prefix)
+    if not base:
+        base = next((name for name in ("main", "master") if name in refs), "")
+    if base not in refs:
+        raise SystemExit("No remote default branch found. Push the initial commit or set TASKS_BASE.")
+    return base, refs
+
+
+@dataclass(frozen=True)
+class Task:
+    text: str
+    fields: dict
+    body: str
+
+    @classmethod
+    def parse(cls, text):
+        match = re.match(r"^---\n(.*?)\n---\n?(.*)$", text, re.S)
+        if not match:
+            return None
+        fields = {}
+        for line in match[1].splitlines():
+            key, sep, value = line.partition(":")
+            if sep:
+                fields[key.strip()] = value.strip()
+        return cls(text, fields, match[2])
+
+    @property
+    def dependencies(self):
+        return [d.strip() for d in self.fields.get("depends", "").strip("[]").split(",") if d.strip()]
+
+    def with_fields(self, **updates):
+        header, separator, body = self.text.partition("\n---\n")
+        for field, value in updates.items():
+            line = f"{field}: {value}".rstrip()
+            header, count = re.subn(rf"^{field}:.*$", lambda _: line, header, count=1, flags=re.M)
+            if not count:
+                header += "\n" + line
+        return Task.parse(header + separator + body)
+
+    def section(self, name):
+        match = re.search(rf"^## {name}\n(.*?)(?=^## |\Z)", self.body, re.S | re.M)
+        return COMMENT.sub("", match[1]).strip() if match else ""
+
+
+def task_id(value):
+    if not ID.fullmatch(value):
+        raise argparse.ArgumentTypeError("use 3–50 lowercase letters, digits and hyphens")
+    return value
+
+
+def task_path(tid):
+    return f"tasks/{tid}.md"
+
+
+def read_task(tip, tid):
+    if tip:
+        return Task.parse(git("show", f"{tip}:{task_path(tid)}", optional=True) or "")
+    return None
+
+
+def task_ids(tip):
+    files = git("ls-tree", "--name-only", f"{tip}:tasks", optional=True) or ""
+    return sorted(Path(name).stem for name in files.splitlines()
+                  if name.endswith(".md") and ID.fullmatch(Path(name).stem))
+
+
+def branch_parts(branch):
+    kind, _, tid = branch.partition("/")
+    if kind not in ("task", "proposal") or not ID.fullmatch(tid):
+        raise SystemExit("Use a task/<id> or proposal/<id> branch.")
+    return kind, tid
+
+
+def proposal_author(base_tip, tip):
+    authors = git("log", "--first-parent", "--format=%(trailers:key=Task-Proposed-By,valueonly)",
+                  f"{base_tip}..{tip}").split()
+    return authors[0] if authors else ""
+
+
+def board(base, refs):
+    main = {tid: read_task(refs[base], tid) for tid in task_ids(refs[base])}
+    rows = {}
+    for tid, task in main.items():
+        if task is None:
+            continue
+        work = read_task(refs.get(f"task/{tid}"), tid)
+        status = task.fields.get("status")
+        who = ""
+        branch = base
+        if status in ("done", "dropped"):
+            state = status
+        elif work and work.fields.get("status") in ("claimed", "done"):
+            branch = f"task/{tid}"
+            task = work
+            who = work.fields.get("owner", "")
+            if work.fields["status"] == "done":
+                state = "review"
+            else:
+                age = time.time() - int(git("show", "-s", "--format=%ct", refs[branch]))
+                state = "stale" if age > STALE_HOURS * 3600 else "claimed"
+        else:
+            if work and work.fields.get("status") == "open":
+                branch = f"task/{tid}"
+            blocked = [d for d in task.dependencies
+                       if not main.get(d) or main[d].fields.get("status") != "done"]
+            if blocked:
+                state, who = "blocked", "waiting for " + ", ".join(blocked)
+            elif task.fields.get("priority") not in ("1", "2", "3"):
+                state = "new"
+            else:
+                state = "open"
+            if branch != base:
+                task = work
+        rows[tid] = (state, who, task, branch)
+
+    for branch, tip in refs.items():
+        kind, _, tid = branch.partition("/")
+        if kind != "proposal" or not ID.fullmatch(tid):
+            continue
+        if tid in rows and rows[tid][0] in ("claimed", "stale", "review"):
+            continue
+        author = proposal_author(refs[base], tip)
+        task = read_task(tip, tid)
+        if author and task:
+            rows[tid] = ("proposed", author, task, branch)
+    return rows
+
+
+def cmd_list(args):
+    base, refs = snapshot(fetch=not args.no_fetch)
+    order = ("claimed", "stale", "review", "open", "proposed", "new", "blocked", "done", "dropped")
+    rows = board(base, refs)
+    shown = False
+    for tid, (state, who, task, _) in sorted(
+        rows.items(), key=lambda row: (order.index(row[1][0]), row[1][2].fields.get("priority", "new"), row[0])
+    ):
+        if args.state and state not in args.state.split(","):
+            continue
+        if not args.all and not args.state and state in ("done", "dropped"):
+            continue
+        priority = task.fields.get("priority", "new")
+        label = f"P{priority}" if priority != "new" else "--"
+        details = f" [{who}]" if who else ""
+        print(f"{tid:<30} {state:<8} {label}  {task.fields.get('title', '')}{details}")
+        shown = True
+    if not shown:
+        print("No matching tasks.")
+
+
+def cmd_show(args):
+    base, refs = snapshot(fetch=not args.no_fetch)
+    row = board(base, refs).get(args.id)
+    if not row:
+        raise SystemExit(f"No task {args.id}.")
+    state, who, task, branch = row
+    print(f"# {state} {who} ({REMOTE}/{branch})")
+    for related in (f"task/{args.id}", f"proposal/{args.id}"):
+        if related in refs:
+            print(f"# {REMOTE}/{related} {refs[related]}")
+    print(task.text)
+
+
+def cmd_new(args):
+    path = ROOT / task_path(args.id)
+    if path.exists():
+        raise SystemExit(f"{path.relative_to(ROOT)} already exists.")
+    if not args.no_fetch:
+        base, refs = snapshot()
+        if args.id in board(base, refs):
+            raise SystemExit(f"Task {args.id} already exists on {REMOTE}.")
+    if args.avenue not in AVENUE.findall((ROOT / "ROADMAP.md").read_text()):
+        raise SystemExit(f"Add an avenue for {args.avenue!r} to ROADMAP.md first.")
+    if len(args.title.splitlines()) != 1 or not args.title.strip():
+        raise SystemExit("The title must be a single nonempty line.")
+    path.write_text(TEMPLATE.format(
+        id=args.id, title=args.title, area=args.area, avenue=args.avenue, priority=args.priority,
+        depends=", ".join(args.depends), agent=identity(args), date=dt.date.today(),
+        goal=args.goal or "<!-- Explain how this task advances the roadmap. -->",
+    ))
+    print(f"Wrote {path.relative_to(ROOT)}. Fill in the task before committing it.")
+
+
+def cmd_propose(args):
+    name = identity(args)
+    branch = git("branch", "--show-current")
+    kind, tid = branch_parts(branch)
+    if kind != "proposal" or not read_task(git("rev-parse", "HEAD"), tid):
+        raise SystemExit("Commit the task file on a matching proposal/<id> branch first.")
+    if git("status", "--porcelain"):
+        raise SystemExit("Commit your changes before proposing them.")
+    base, refs = snapshot()
+    if not git("diff", "--name-only", f"{refs[base]}...HEAD", "--", task_path(tid)):
+        raise SystemExit(f"The proposal must modify {task_path(tid)}.")
+    git("commit", "--quiet", "--allow-empty", "-m", f"task {tid}: proposed",
+        "-m", f"Task-Proposed-By: {name}")
+    git("push", "--quiet", "--set-upstream", REMOTE, f"HEAD:refs/heads/{branch}")
+    print(f"Submitted {REMOTE}/{branch} for review.")
+
+
+def append_log(task, name, message):
+    stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return task.text.rstrip() + f"\n- {stamp} {name}: {' '.join(message.split())}\n"
+
+
+def commit_task(cwd, tid, task, name, message, fields=None, unique=False):
+    if fields:
+        task = task.with_fields(**fields)
+    path = task_path(tid)
+    (cwd / path).write_text(append_log(task, name, message))
+    # An identical commit would make a competing push appear up to date.
+    extra = ("-m", f"Claim-ID: {uuid.uuid4()}") if unique else ()
+    git("commit", "--quiet", "--only", "-m", f"task {tid}: {message.splitlines()[0][:70]}",
+        *extra, "--", path, cwd=cwd)
+
+
+def cmd_claim(args):
+    name = identity(args)
+    base, refs = snapshot()
+    row = board(base, refs).get(args.id)
+    claimable = ("open", "stale") if args.force else ("open",)
+    if not row or row[0] not in claimable:
+        state = row[0] if row else "unknown"
+        raise SystemExit(f"{args.id} is {state}. Claim an open task or arrange a stale handoff.")
+    _, _, task, _ = row
+    branch = f"task/{args.id}"
+    previous = refs.get(branch, "")
+    ref = f"refs/heads/{branch}"
+    worktree = Path(args.worktree).resolve()
+    git("worktree", "add", "-b", branch, str(worktree), previous or refs[base])
+    if previous:
+        task = read_task(previous, args.id) or task
+    former = task.fields.get("owner") if row[0] == "stale" else None
+    message = f"took over stale claim from {former}" if former else "claimed"
+    commit_task(worktree, args.id, task, name, message, {"status": "claimed", "owner": name}, unique=True)
+    git("push", "--quiet", "--set-upstream", f"--force-with-lease={ref}:{previous}",
+        REMOTE, f"HEAD:{ref}", cwd=worktree)
+    print(f"Claimed {args.id} in {worktree} on {REMOTE}/{branch}.")
+
+
+def update_current(args, action):
+    name = identity(args)
+    branch = git("branch", "--show-current")
+    kind, tid = branch_parts(branch)
+    base, refs = snapshot()
+    tip = refs.get(branch)
+    landed = read_task(refs[base], tid)
+    remote = read_task(tip, tid)
+    task = read_task(git("rev-parse", "HEAD"), tid)
+    if kind != "task" or not task or not remote or remote.fields.get("owner") != name:
+        raise SystemExit(f"{name} must own an active task branch to {action}.")
+    if landed and landed.fields.get("status") in ("done", "dropped"):
+        raise SystemExit(f"{tid} is already {landed.fields['status']}.")
+    if git("merge-base", "--is-ancestor", tip, "HEAD", optional=True) is None:
+        raise SystemExit(f"Local work is behind {REMOTE}/{branch}. Integrate its changes first.")
+    pathspec = ("--", task_path(tid)) if action == "log" else ()
+    if git("status", "--porcelain", *pathspec):
+        raise SystemExit("Commit the pending changes before updating the task.")
+
+    fields = None
+    if action == "log":
+        message = args.message
+    elif action == "submit":
+        if not task.section("Outcome"):
+            raise SystemExit(f"Fill in and commit the Outcome in {task_path(tid)} first.")
+        fields = {"status": "done"}
+        message = "submitted" + (f" — {args.summary}" if args.summary else "")
+    else:
+        fields = {"status": "open", "owner": ""}
+        message = f"released — {args.reason}"
+    if not message.strip():
+        raise SystemExit("Supply a progress message.")
+    commit_task(ROOT, tid, task, name, message.strip(), fields)
+    git("push", "--quiet", REMOTE, f"HEAD:refs/heads/{branch}")
+    print(f"{message.strip()} ({REMOTE}/{branch})")
+
+
+def submission(branch, base, refs):
+    kind, tid = branch_parts(branch)
+    tip = refs.get(branch)
+    task = read_task(tip, tid)
+    if not task or (kind == "task" and task.fields.get("status") != "done"):
+        raise SystemExit(f"No submitted work on {REMOTE}/{branch}.")
+    if git("merge-base", "--is-ancestor", tip, refs[base], optional=True) is not None:
+        raise SystemExit(f"{branch} is already merged into {base}.")
+    if kind == "task":
+        landed = read_task(refs[base], tid)
+        if not landed or landed.fields.get("status") in ("done", "dropped"):
+            raise SystemExit(f"{tid} is no longer an active task on {base}.")
+    author = task.fields.get("owner") if kind == "task" else proposal_author(refs[base], tip)
+    if not author:
+        raise SystemExit(f"{task_path(tid)} does not name a submission author.")
+    return tip, author
+
+
+def cmd_review(args):
+    reviewer = identity(args)
+    base, refs = snapshot()
+    tip, author = submission(args.branch, base, refs)
+    if author == reviewer:
+        raise SystemExit("Another agent must review the submission.")
+    if args.tip != tip:
+        raise SystemExit(f"The submission tip changed. Fetch and inspect {tip} before reviewing.")
+
+    review_branch = f"review/{args.branch}"
+    previous = refs.get(review_branch)
+    review = dict(tip=tip, reviewer=reviewer, verdict=args.verdict, message=args.message, notes=args.note)
+    # Append the review without switching the reviewer's worktree.
+    blob = git("hash-object", "-w", "--stdin", data=json.dumps(review, indent=2) + "\n")
+    tree = git("mktree", data=f"100644 blob {blob}\treview.json\n")
+    parent = ("-p", previous) if previous else ()
+    commit = git("commit-tree", tree, *parent, "-m", f"{args.verdict} {args.branch} @ {tip[:12]}")
+    git("push", "--quiet", REMOTE, f"{commit}:refs/heads/{review_branch}")
+    print(f"Published {args.verdict} for {tip} on {REMOTE}/{review_branch}.")
+
+
+def cmd_reviews(args):
+    branch_parts(args.branch)
+    _, refs = snapshot(fetch=not args.no_fetch)
+    review_tip = refs.get(f"review/{args.branch}")
+    if not review_tip:
+        print("No reviews.")
+        return
+    for commit in git("log", "--format=%H", review_tip).splitlines():
+        review = json.loads(git("show", f"{commit}:review.json"))
+        marker = "current" if review["tip"] == refs.get(args.branch) else "older"
+        print(f"{review['verdict']} by {review['reviewer']} at {review['tip']} ({marker})")
+        print(review["message"])
+        for location, note in review["notes"]:
+            print(f"  {location} — {note}")
+
+
+def cmd_merge(args):
+    merger = identity(args)
+    base, refs = snapshot()
+    tip, author = submission(args.branch, base, refs)
+    if merger == author:
+        raise SystemExit("Another agent must merge the submission.")
+    review_branch = f"review/{args.branch}"
+    review_tip = refs.get(review_branch)
+    review = json.loads(git("show", f"{review_tip}:review.json")) if review_tip else {}
+    if (review.get("verdict") != "approve" or review.get("tip") != tip
+            or not review.get("reviewer") or review.get("reviewer") == author):
+        raise SystemExit("The current tip needs a latest approval from another agent.")
+
+    base_tip = refs[base]
+    base_ref = f"refs/heads/{base}"
+    with tempfile.TemporaryDirectory(prefix="tasks-merge-") as scratch:
+        worktree = Path(scratch) / "worktree"
+        git("worktree", "add", "--detach", str(worktree), base_tip)
+        try:
+            git("merge", "--no-ff", "-m", f"Merge {args.branch}", tip, cwd=worktree)
+            merge = git("rev-parse", "HEAD", cwd=worktree)
+            if subprocess.run(["bash", "scripts/check", base_tip], cwd=worktree).returncode:
+                raise SystemExit("Verification failed. No merge was pushed.")
+            current_base, current = snapshot()
+            if current_base != base or any(current.get(branch) != refs[branch]
+                                           for branch in (base, args.branch, review_branch)):
+                raise SystemExit("The base, submission, or review changed during checks. Retry the merge.")
+            git("push", "--quiet", f"--force-with-lease={base_ref}:{base_tip}", REMOTE, f"{merge}:{base_ref}")
+        finally:
+            git("worktree", "remove", "--force", str(worktree))
+    print(f"Merged {args.branch} into {REMOTE}/{base} at {merge}.")
+
+
+def cmd_lint(_args):
+    known = AVENUE.findall((ROOT / "ROADMAP.md").read_text())
+    errors = [] if known else ["ROADMAP.md has no '### Avenue `<id>`' headings."]
+    tasks = {}
+    for path in sorted((ROOT / "tasks").glob("*.md")):
+        if path.name == "README.md":
+            continue
+        task = Task.parse(path.read_text())
+        if not task:
+            errors.append(f"{path.name}: missing front matter")
+            continue
+        tasks[path.stem] = task
+        fields = task.fields
+        if not ID.fullmatch(path.stem) or fields.get("id") != path.stem:
+            errors.append(f"{path.name}: invalid id or id differs from file name")
+        for key in ("title", "created", "created_by"):
+            if not fields.get(key):
+                errors.append(f"{path.name}: missing {key}")
+        for key, choices in (("status", STATUSES), ("area", AREAS), ("avenue", known), ("priority", PRIORITIES)):
+            if fields.get(key) not in choices:
+                errors.append(f"{path.name}: {key} must be one of {', '.join(choices)}")
+        for section in ("Goal", "Done when", "Log"):
+            if not task.section(section):
+                errors.append(f"{path.name}: missing or empty {section}")
+        if fields.get("status") in ("claimed", "done") and not fields.get("owner"):
+            errors.append(f"{path.name}: missing owner")
+        if fields.get("status") == "done" and not task.section("Outcome"):
+            errors.append(f"{path.name}: missing Outcome")
+    for tid, task in tasks.items():
+        for dep in task.dependencies:
+            if dep not in tasks or dep == tid:
+                errors.append(f"{tid}.md: invalid dependency {dep}")
+    if errors:
+        raise SystemExit("\n".join(errors))
+    print(f"{len(tasks)} tasks ok")
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="tasks", description=__doc__)
+    parser.add_argument("--agent", help="session name, defaults to TASKS_AGENT")
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    def command(name, handler, help_text, *positionals, no_fetch=False):
+        sub = commands.add_parser(name, help=help_text)
+        for arg in positionals:
+            sub.add_argument(arg, type=task_id if arg == "id" else str)
+        if no_fetch:
+            sub.add_argument("--no-fetch", action="store_true")
+        sub.set_defaults(handler=handler)
+        return sub
+
+    listing = command("list", cmd_list, "show the task board", no_fetch=True)
+    listing.add_argument("--all", action="store_true", help="include done and dropped tasks")
+    listing.add_argument("--state", help="comma-separated task states")
+    command("show", cmd_show, "show a task and its branches", "id", no_fetch=True)
+    new = command("new", cmd_new, "create a task file", "id", no_fetch=True)
+    new.add_argument("--title", required=True)
+    new.add_argument("--area", choices=AREAS, required=True)
+    new.add_argument("--avenue", required=True)
+    new.add_argument("--priority", choices=PRIORITIES, default="new")
+    new.add_argument("--goal")
+    new.add_argument("--depends", nargs="*", type=task_id, default=[])
+    command("propose", cmd_propose, "submit this task definition or triage change for review")
+    claim = command("claim", cmd_claim, "claim an open task in a new worktree", "id")
+    claim.add_argument("--worktree", required=True, metavar="DIR")
+    claim.add_argument("--force", action="store_true", help="take over an agreed stale claim")
+    command("log", lambda a: update_current(a, "log"), "log and push progress", "message")
+    submit = command("submit", lambda a: update_current(a, "submit"), "submit this task branch for review")
+    submit.add_argument("--summary")
+    release = command("release", lambda a: update_current(a, "release"), "release the claim and keep its branch")
+    release.add_argument("--reason", required=True)
+    review = command("review", cmd_review, "publish a review for a specific commit", "branch")
+    review.add_argument("--tip", required=True, help="the full SHA you reviewed")
+    review.add_argument("-m", "--message", required=True)
+    review.add_argument("--note", nargs=2, action="append", default=[], metavar=("PATH[:LINE]", "TEXT"))
+    verdict = review.add_mutually_exclusive_group(required=True)
+    verdict.add_argument("--approve", dest="verdict", action="store_const", const="approve")
+    verdict.add_argument("--changes", dest="verdict", action="store_const", const="changes")
+    command("reviews", cmd_reviews, "read reviews from Git", "branch", no_fetch=True)
+    command("merge", cmd_merge, "verify and merge an independently approved branch", "branch")
+    command("lint", cmd_lint, "validate task files")
+
+    args = parser.parse_args()
+    if args.command != "lint":
+        require_repository()
+    args.handler(args)
+
+
+if __name__ == "__main__":
+    main()
